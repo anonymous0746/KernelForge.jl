@@ -1,0 +1,299 @@
+@inline default_workgroup(arch::AbstractArch, ::Type{MapReduce1D}, n, ::Type{T}) where T = default_workgroup(arch)
+@inline function default_workgroup(::AMDArch, ::Type{MapReduce1D}, n, ::Type{T}) where T
+    return 256
+end
+
+@inline default_blocks(arch::AbstractArch, ::Type{MapReduce1D}, n, ::Type{T}) where T = default_blocks(arch)
+@inline default_blocks(arch::AMDArch, ::Type{MapReduce1D}, n, ::Type{T}) where T = 256
+
+
+@inline function default_nitem(::AbstractArch, ::Type{MapReduce1D}, n, ::Type{T}) where {T}
+    prevpow(2, cld(16, cld(sizeof(T), 2)))
+end
+
+@inline function default_nitem(::RTX1000, ::Type{MapReduce1D}, n, ::Type{T}) where {T}
+    prevpow(2, cld(16, cld(sizeof(T), 2)))
+end
+
+@inline function default_nitem(::A40, ::Type{MapReduce1D}, n, ::Type{T}) where {T}
+    return prevpow(2, cld(16, cld(sizeof(T), 2)))
+end
+
+@inline function default_nitem(::AMDArch, ::Type{MapReduce1D}, n, ::Type{T}) where {T}
+    return prevpow(2, cld(32, cld(sizeof(T), 2)))
+end
+
+# ============================================================================
+# Public API docstrings
+# ============================================================================
+
+"""
+    mapreduce1d(f, op, src; kwargs...) -> scalar or GPU array
+    mapreduce1d(f, op, srcs::NTuple; kwargs...) -> scalar or GPU array
+
+GPU parallel map-reduce operation.
+
+Applies `f` to each element, reduces with `op`, and optionally applies `g` to the final result.
+
+# Arguments
+- `f`: Map function applied to each element
+- `op`: Associative binary reduction operator
+- `src` or `srcs`: Input GPU array(s)
+
+# Keyword Arguments
+- `g=identity`: Post-reduction transformation applied to final result
+- `tmp=nothing`: Pre-allocated `KernelBuffer` (or `nothing` to allocate automatically)
+- `Nitem=nothing`: Items per thread (auto-selected if nothing)
+- `workgroup=nothing`: Workgroup size (auto-selected if nothing)
+- `blocks=nothing`: Number of blocks (auto-selected if nothing)
+- `arch=nothing`: Architecture (auto-detected from `src` if nothing)
+- `to_cpu=true`: If true, return scalar; otherwise return 1-element GPU array
+
+# Examples
+```julia
+# Sum of squares
+x = CUDA.rand(Float32, 10_000)
+result = mapreduce1d(x -> x^2, +, x)
+
+# Return GPU array instead of scalar
+result = mapreduce1d(x -> x^2, +, x; to_cpu=false)
+
+# Dot product of two arrays
+x, y = CUDA.rand(Float32, 10_000), CUDA.rand(Float32, 10_000)
+result = mapreduce1d((a, b) -> a * b, +, (x, y))
+```
+
+See also: [`KernelForge.mapreduce1d!`](@ref) for the in-place version.
+"""
+function mapreduce1d end
+
+"""
+    mapreduce1d!(f, op, dst, src; kwargs...)
+    mapreduce1d!(f, op, dst, srcs::NTuple; kwargs...)
+
+In-place GPU parallel map-reduce, writing result to `dst[1]`.
+
+# Arguments
+- `f`: Map function applied to each element
+- `op`: Associative binary reduction operator
+- `dst`: Output array (result written to first element)
+- `src` or `srcs`: Input GPU array(s)
+
+# Keyword Arguments
+- `g=identity`: Post-reduction transformation applied to final result
+- `tmp=nothing`: Pre-allocated `KernelBuffer` (or `nothing` to allocate automatically)
+- `Nitem=nothing`: Items per thread (auto-selected if nothing)
+- `workgroup=nothing`: Workgroup size (auto-selected if nothing)
+- `blocks=nothing`: Number of blocks (auto-selected if nothing)
+- `arch=nothing`: Architecture (auto-detected from `src` if nothing)
+
+# Examples
+```julia
+x = CUDA.rand(Float32, 10_000)
+dst = CUDA.zeros(Float32, 1)
+
+# Sum
+mapreduce1d!(identity, +, dst, x)
+
+# With pre-allocated buffer for repeated calls
+tmp = KernelForge.get_allocation(MapReduce1D, x -> x^2, +, x)
+for i in 1:100
+    mapreduce1d!(x -> x^2, +, dst, x; tmp)
+end
+```
+
+See also: [`KernelForge.mapreduce1d`](@ref) for the allocating version.
+"""
+function mapreduce1d! end
+
+# ============================================================================
+# Buffer allocation
+# ============================================================================
+
+"""
+    get_allocation(::Type{MapReduce1D}, f, op, src_or_srcs, workgroup=nothing, blocks=nothing, arch=nothing)
+
+Allocate a `KernelBuffer` for `mapreduce1d!`. Useful for repeated reductions.
+
+# Arguments
+- `f`: Map function (used to infer intermediate eltype)
+- `op`: Reduction operator
+- `src_or_srcs`: Input GPU array or NTuple of arrays (used to determine backend and eltype)
+- `workgroup=nothing`: Workgroup size (auto-selected if nothing)
+- `blocks=nothing`: Number of blocks (must match `blocks` used in `mapreduce1d!`; auto-selected if nothing)
+- `arch=nothing`: Architecture (auto-detected from `src` if nothing)
+
+# Returns
+A `KernelBuffer` with named fields `partial` and `flag` (flags are `UInt8`).
+
+# Examples
+```julia
+x = CUDA.rand(Float32, 10_000)
+tmp = KernelForge.get_allocation(MapReduce1D, x -> x^2, +, x)
+dst = CUDA.zeros(Float32, 1)
+
+for i in 1:100
+    mapreduce1d!(x -> x^2, +, dst, x; tmp)
+end
+```
+"""
+function get_allocation(
+    ::Type{MapReduce1D},
+    f::F,
+    op::O,
+    src::AT,
+    workgroup=nothing,
+    blocks=nothing,
+    arch=nothing
+) where {F<:Function,O<:Function,AT<:AbstractArray}
+    return get_allocation(MapReduce1D, f, op, (src,), workgroup, blocks, arch)
+end
+
+function get_allocation(
+    ::Type{MapReduce1D},
+    f::F,
+    op::O,
+    srcs::NTuple{U,AT},
+    workgroup=nothing,
+    blocks=nothing,
+    arch=nothing
+) where {U,F<:Function,O<:Function,AT<:AbstractArray}
+    arch = something(arch, detect_arch(srcs[1]))
+    T = eltype(AT)
+    workgroup = something(workgroup, default_workgroup(arch, MapReduce1D, length(srcs[1]), T))
+    blocks = something(blocks, default_blocks(arch, MapReduce1D, length(srcs[1]), T))
+    H = Base.promote_op(f, ntuple(_ -> T, Val(U))...)
+    backend = get_backend(srcs[1])
+    partial = KernelAbstractions.allocate(backend, H, blocks)
+    flag = KernelAbstractions.allocate(backend, UInt8, blocks)
+    return KernelBuffer((; partial, flag))
+end
+
+# ============================================================================
+# Allocating API
+# ============================================================================
+
+# Single array: forward to tuple method
+function mapreduce1d(
+    f::F, op::O,
+    src::AT;
+    kwargs...
+) where {F<:Function,O<:Function,AT<:AbstractArray}
+    return mapreduce1d(f, op, (src,); kwargs...)
+end
+
+# Tuple of arrays: allocate dst then delegate to mapreduce1d!
+function mapreduce1d(
+    f::F, op::O,
+    srcs::NTuple{U,AT};
+    g::G=identity,
+    tmp::TMP=nothing,
+    Nitem=nothing,
+    workgroup=nothing,
+    blocks=nothing,
+    arch=nothing,
+    to_cpu::Bool=true
+) where {U,AT<:AbstractArray,F<:Function,O<:Function,G<:Function,TMP<:Union{KernelBuffer,Nothing}}
+    T = eltype(AT)
+    H = Base.promote_op(f, ntuple(_ -> T, Val(U))...)
+    S = Base.promote_op(g, H)
+    backend = get_backend(srcs[1])
+    dst = KernelAbstractions.allocate(backend, S, 1)
+    mapreduce1d!(f, op, dst, srcs; g, tmp, Nitem, workgroup, blocks, arch)
+    return to_cpu ? Array(dst)[1] : dst
+end
+
+# ============================================================================
+# In-place API
+# ============================================================================
+
+# Single array: forward to tuple method
+function mapreduce1d!(
+    f::F, op::O,
+    dst::DS,
+    src::AT;
+    kwargs...
+) where {F<:Function,O<:Function,DS<:AbstractArray,AT<:AbstractArray}
+    return mapreduce1d!(f, op, dst, (src,); kwargs...)
+end
+
+# Main in-place entry point
+function mapreduce1d!(
+    f::F, op::O,
+    dst::DS,
+    srcs::NTuple{U,AT};
+    g::G=identity,
+    tmp::TMP=nothing,
+    Nitem=nothing,
+    workgroup=nothing,
+    blocks=nothing,
+    arch=nothing
+) where {U,DS<:AbstractArray,AT<:AbstractArray,F<:Function,O<:Function,G<:Function,TMP<:Union{KernelBuffer,Nothing}}
+    T = eltype(AT)
+    n = length(srcs[1])
+    backend = get_backend(srcs[1])
+    H = Base.promote_op(f, ntuple(_ -> T, Val(U))...)
+    arch = something(arch, detect_arch(srcs[1]))
+    workgroup = something(workgroup, default_workgroup(arch, MapReduce1D, n, T))
+    Nitem = something(Nitem, default_nitem(arch, MapReduce1D, n, T))
+    blocks = something(blocks, default_blocks(arch, MapReduce1D, n, T))
+    _mapreduce1d_impl!(f, op, g, dst, srcs, Nitem, workgroup, blocks, tmp, H, n, backend, arch)
+end
+
+# ============================================================================
+# Core implementation
+# ============================================================================
+
+# Nothing dispatch: allocate buffer then forward to KernelBuffer method.
+# Avoids passing a Union{KernelBuffer,Nothing} into the impl, which
+# would cause type instability and spurious allocations.
+function _mapreduce1d_impl!(
+    f::F, op::O, g::G,
+    dst::DS,
+    srcs::NTuple{U,AT},
+    Nitem::Int,
+    workgroup::Int,
+    blocks::Int,
+    ::Nothing,
+    ::Type{H},
+    n::Int,
+    backend,
+    arch
+) where {U,DS<:AbstractArray,AT<:AbstractArray,F,O,G,H}
+    tmp = get_allocation(MapReduce1D, f, op, srcs, workgroup, blocks, arch)
+    _mapreduce1d_impl!(f, op, g, dst, srcs, Nitem, workgroup, blocks, tmp, H, n, backend, arch)
+end
+
+function _mapreduce1d_impl!(
+    f::F, op::O, g::G,
+    dst::DS,
+    srcs::NTuple{U,AT},
+    Nitem::Int,
+    workgroup::Int,
+    blocks::Int,
+    tmp::KernelBuffer,
+    ::Type{H},
+    n::Int,
+    backend,
+    arch
+) where {U,DS<:AbstractArray,AT<:AbstractArray,F,O,G,H}
+    flag = tmp.arrays.flag
+    fill!(flag, 0x00)
+    partial = tmp.arrays.partial
+
+    workgroup = min(workgroup, n)
+    ndrange = min(blocks * workgroup, max(fld(n, workgroup) * workgroup, 1))
+    Nitem = min(Nitem, prevpow(2, max(fld(n, ndrange), 1)))
+
+    T = eltype(AT)
+    Alignment = if U == 1
+        (Int(pointer(srcs[1])) ÷ sizeof(T)) % Nitem + 1
+    else
+        aligns = ntuple(i -> (Int(pointer(srcs[i])) ÷ sizeof(T)) % Nitem, Val(U))
+        allequal(aligns) ? aligns[1] + 1 : -1
+    end
+    warpsz = get_warpsize(arch)
+    mapreduce1d_kernel!(backend, workgroup, ndrange)(
+        f, op, g, dst, srcs, Val(Nitem), partial, flag, Val(Alignment), Val(warpsz); ndrange
+    )
+end

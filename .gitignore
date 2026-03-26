@@ -1,0 +1,16 @@
+/dev
+**/local
+test/local/
+
+perfs/_barplot_scripts_old/
+**/build
+**/bin
+*.png
+*tmp.jl
+*dev.jl
+/perfs/figures
+/.claude
+
+
+Manifest.toml
+docs/Manifest.toml

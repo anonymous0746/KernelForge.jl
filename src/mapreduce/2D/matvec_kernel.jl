@@ -1,0 +1,480 @@
+@kernel unsafe_indices = true function matvec_kernel!(
+    f::F, op::O, g::G,
+    dst::AbstractArray{S},
+    src::AbstractArray{T},
+    x,
+    ::Val{chunksz}, ::Val{Nblocks}, ::Val{Nitem},
+    partial::Union{Nothing,AbstractArray{NTuple{Nitem,H}}},
+    flag::Union{Nothing,AbstractArray{UInt8}},
+    ::Type{H},
+    ::Val{warpsz}
+) where {F<:Function,O<:Function,G<:Function,T,H,S,chunksz,Nblocks,warpsz,Nitem}
+    @uniform begin
+        n, p = size(src)
+        workgroup = @groupsize()[1]
+        Nchunks = cld(workgroup, chunksz)
+    end
+
+    # Shared memory for inter-warp reduction: one element per chunk
+    # careful that the size is equal to sizeof(H) * chunksz * cld(workgroup,warpsz) which can be large if chunksz if large
+    # This is a reason why we try to keep chunksz small in practice.
+    shared = @localmem NTuple{Nitem,H} max(chunksz * cld(workgroup, warpsz), warpsz)
+
+    lid = Int(@index(Local))
+    gid = Int(@index(Group))
+
+    #chunksz is exactly the number of rows that a workgroup takes
+
+    # which warp within the workgroup?
+    wid = cld(lid, warpsz)
+    lane = (lid - 1) % warpsz + 1
+    # Which lane within this group?
+    chlane = (lid - 1) % chunksz + 1
+    # Which chunk within the group?
+    chunk = cld(lid, chunksz)
+
+    # Which set of block ?
+    sid = cld(gid, Nblocks)
+    # Which set of chunk for a given block?
+    schid = (gid - 1) % Nblocks + 1
+    first_col = (schid - 1) * Nchunks + chunk
+
+    # Global row index
+    global_row = (sid - 1) * chunksz + chlane
+
+
+    nbatch = cld(n, Nitem)
+    # Strided reduction over columns
+    col = first_col
+    id_base = Nitem * (global_row - 1) + (col - 1) * n + 1  # 
+    if id_base + Nitem - 1 <= n * p && col <= p
+        values = vload(src, id_base, Val(Nitem), Val(false))
+    else
+        values = safe_vload(src, id_base, n * p, Val(Nitem))
+        #values = ntuple(i -> src[n*p], Val(Nitem))
+    end
+    values = isnothing(x) ? f.(values) : f.(values, x[col])
+    val = values  # now a tuple of Nitem elements
+
+
+    col += Nchunks * Nblocks
+    if global_row <= nbatch
+        while col <= p
+            id_base = Nitem * (global_row - 1) + (col - 1) * n + 1
+            if id_base + Nitem - 1 <= n * p
+                new_values = vload(src, id_base, Val(Nitem), Val(false))
+            else
+                new_values = safe_vload(src, id_base, n * p, Val(Nitem))
+                #new_values = ntuple(i -> src[n*p], Val(Nitem))
+            end
+            new_values = isnothing(x) ? f.(new_values) : f.(new_values, x[col])
+            val = op.(val, new_values)
+            col += Nchunks * Nblocks
+        end
+    end
+    # Shuffle reduction within chunk
+    offset = chunksz
+    while offset < warpsz
+        shuffled = @shfl(Up, val, offset)
+        if lane > offset
+            val = op.(val, shuffled)
+        end
+        offset <<= 1
+    end
+    if Nblocks == 1 && global_row <= nbatch && (workgroup == warpsz || chunksz == workgroup)
+        gval = g.(val)  # NTuple{Nitem,S}
+        row_base = Nitem * (global_row - 1) + 1
+        if row_base + Nitem - 1 <= n
+            vstore!(dst, row_base, gval, Val(false))
+        else
+            # partial tail: scalar fallback
+            for i in 1:Nitem
+                row = row_base + i - 1
+                if row <= n
+                    dst[row] = gval[i]
+                end
+            end
+        end
+        Base.@goto done
+    end
+    if cld(lane, chunksz) == cld(warpsz, chunksz)
+        idx = chunksz <= warpsz ? (wid - 1) * chunksz + chlane : (wid - 1) * warpsz + lane
+        shared[idx] = val
+        #gid == 1 && chlane==1 && @print("$val, $idx, $chlane, $wid, lane: $lane chunksz: $chunksz\n")
+    end
+
+    @synchronize
+
+    #if wid % cld(warpsz, threads_per_row) == 1 
+    warps_per_row = cld(workgroup, max(warpsz, chunksz))
+    if wid <= cld(chunksz * warps_per_row, warpsz)
+        idx = cld(lane, warps_per_row) + ((lane - 1) % warps_per_row) * chunksz + (wid - 1) * cld(warpsz, warps_per_row)
+        val = shared[idx]
+        offset = 1
+        #gid == 1 && wid == 1 && @print("secc:  $val, $lane, $idx, $wid, idx: $idx, warps_per_row: $warps_per_row, abc: $(warps_per_row)\n")
+        while offset < warps_per_row
+            shuffled = @shfl(Up, val, offset)
+            if lane > offset
+                val = op.(val, shuffled)
+            end
+            offset <<= 1
+        end
+        if lane % warps_per_row == 0 && cld(lane, warps_per_row) <= chunksz
+            idx = (sid - 1) * chunksz + (wid - 1) * cld(warpsz, warps_per_row) + cld(lane, warps_per_row)
+            if idx <= nbatch
+                if Nblocks == 1
+                    gval = g.(val)
+                    row_base = Nitem * (idx - 1) + 1
+                    if row_base + Nitem - 1 <= n
+                        vstore!(dst, row_base, gval, Val(false))
+                    else
+                        for i in 1:Nitem
+                            row = row_base + i - 1
+                            if row <= n
+                                dst[row] = gval[i]
+                            end
+                        end
+                    end
+                else
+                    partial[(schid-1)*nbatch+idx] = val
+                    @access flag[(schid-1)*nbatch+idx] = 0x01
+                end
+            end
+        end
+    end
+    Nblocks == 1 && Base.@goto done
+    if gid % Nblocks == 1
+        col = chunk
+        if global_row <= nbatch && col <= Nblocks
+            while true
+                (@access flag[(col-1)*nbatch+global_row]) == 0x01 && break
+            end
+            val = partial[(col-1)*nbatch+global_row]
+        end
+        col += Nchunks
+        if global_row <= nbatch
+            while col <= Nblocks
+                while true
+                    (@access flag[(col-1)*nbatch+global_row]) == 0x01 && break
+                end
+                @inbounds val = op.(val, partial[(col-1)*nbatch+global_row])
+                col += Nchunks
+            end
+        end
+        offset = chunksz
+        #global_row == 1 && @print("$val,    $lane    $chunksz", "\n")
+        #gid == 1 && global_row == 2 && @print("$val,  $(cld(lid,chunksz)),  wid: $wid, lane: $lane chunksz: $chunksz\n")
+        while offset < min(chunksz * Nblocks, warpsz)
+            shuffled = @shfl(Up, val, offset)
+            if lane > offset
+                val = op.(val, shuffled)
+            end
+            offset <<= 1
+        end
+        if chunksz * Nblocks <= warpsz
+            if global_row <= nbatch && cld(lane, chunksz) == Nblocks
+                gval = g.(val)
+                row_base = Nitem * (global_row - 1) + 1
+                if row_base + Nitem - 1 <= n
+                    vstore!(dst, row_base, gval, Val(false))
+                else
+                    for i in 1:Nitem
+                        row = row_base + i - 1
+                        if row <= n
+                            dst[row] = gval[i]
+                        end
+                    end
+                end
+            end
+            Base.@goto done
+        end
+        #edge case can happen if warpsz < chunksz * Nblocks < workgroup
+        idx = chunksz <= warpsz ? (wid - 1) * chunksz + chlane : (wid - 1) * warpsz + lane
+        if (
+            cld(lid, chunksz) <= Nblocks && cld(lane, chunksz) == cld(warpsz, chunksz)
+            ||
+            cld(lid, chunksz) == Nblocks #edge case
+        )
+            shared[idx] = val
+        end
+        @synchronize
+
+        # The min is for edge case
+        warps_per_row = min(cld(workgroup, max(warpsz, chunksz)), Nblocks, cld(chunksz * Nblocks, warpsz))
+        if wid <= cld(chunksz * warps_per_row, warpsz)
+            idx = cld(lane, warps_per_row) + ((lane - 1) % warps_per_row) * chunksz + (wid - 1) * cld(warpsz, warps_per_row)
+            val = shared[idx]
+            offset = 1
+            idx = (sid - 1) * chunksz + (wid - 1) * cld(warpsz, warps_per_row) + cld(lane, warps_per_row)
+            #idx == 7 && @print("$val $lane  $idx  $(chunksz * warps_per_row) \n")
+            while offset < warps_per_row
+                shuffled = @shfl(Up, val, offset)
+                if (lane - 1) % warps_per_row + 1 > offset
+                    val = op.(val, shuffled)
+                end
+                offset <<= 1
+            end
+
+            if lane % warps_per_row == 0 && cld(lane, warps_per_row) <= chunksz
+                if idx <= nbatch
+                    gval = g.(val)
+                    row_base = Nitem * (idx - 1) + 1
+                    if row_base + Nitem - 1 <= n
+                        vstore!(dst, row_base, gval, Val(false))
+                    else
+                        for i in 1:Nitem
+                            row = row_base + i - 1
+                            if row <= n
+                                dst[row] = gval[i]
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    Base.@label done
+end
+
+
+
+# @kernel unsafe_indices = true inbounds = true function matvec_kernel!(
+#     f::F, op::O, g::G,
+#     dst::AbstractArray{S},
+#     src::AbstractArray{T},
+#     x,
+#     ::Val{chunksz}, ::Val{Nblocks}, ::Val{1},
+#     partial::Union{Nothing,AbstractArray{H}},
+#     flag::Union{Nothing,AbstractArray{UInt8}},
+#     ::Type{H},
+#     ::Val{warpsz}
+# ) where {F<:Function,O<:Function,G<:Function,T,H,S,chunksz,Nblocks,warpsz}
+#     @print("abc\n")
+#     @uniform begin
+#         n, p = size(src)
+#         workgroup = @groupsize()[1]
+#         Nchunks = cld(workgroup, chunksz)
+#     end
+
+#     # Shared memory for inter-warp reduction: one element per chunk
+#     # careful that the size is equal to sizeof(H) * chunksz * cld(workgroup,warpsz) which can be large if chunksz if large
+#     # This is a reason why we try to keep chunksz small in practice.
+#     shared = @localmem H max(chunksz * cld(workgroup, warpsz), warpsz)
+
+#     lid = @index(Local)
+#     gid = @index(Group)
+
+#     #chunksz is exactly the number of rows that a workgroup takes
+
+#     # which warp within the workgroup?
+#     wid = cld(lid, warpsz)
+#     lane = (lid - 1) % warpsz + 1
+#     # Which lane within this group?
+#     chlane = (lid - 1) % chunksz + 1
+#     # Which chunk within the group?
+#     chunk = cld(lid, chunksz)
+
+#     # Which set of block ?
+#     sid = cld(gid, Nblocks)
+#     # Which set of chunk for a given block?
+#     schid = (gid - 1) % Nblocks + 1
+#     first_col = (schid - 1) * Nchunks + chunk
+
+#     # Global row index
+#     global_row = (sid - 1) * chunksz + chlane
+
+
+
+#     # Strided reduction over columns
+#     col = first_col
+#     if global_row <= n && col <= p
+#         val = isnothing(x) ? f(src[global_row, col]) : f(src[global_row, col], x[col])
+#     else
+#         val = isnothing(x) ? f(src[n, col]) : f(src[n, col], x[col]) # dummy value to define val (avoid the use of zero)
+#     end
+#     col += Nchunks * Nblocks
+#     if global_row <= n
+#         while col <= p
+#             new_val = isnothing(x) ? f(src[global_row, col]) : f(src[global_row, col], x[col])
+#             val = op(val, new_val)
+#             col += Nchunks * Nblocks
+#         end
+#     end
+#     # Shuffle reduction within chunk
+#     offset = chunksz
+#     while offset < warpsz
+#         shuffled = @shfl(Up, val, offset)
+#         if lane > offset
+#             val = op(val, shuffled)
+#         end
+#         offset <<= 1
+#     end
+#     if Nblocks == 1 && global_row <= n && (workgroup == warpsz || chunksz == workgroup)
+#         dst[global_row] = g(val)
+#         Base.@goto done
+#     end
+#     if cld(lane, chunksz) == cld(warpsz, chunksz)
+#         idx = chunksz <= warpsz ? (wid - 1) * chunksz + chlane : (wid - 1) * warpsz + lane
+#         shared[idx] = val
+#         #gid == 1 && chlane==1 && @print("$val, $idx, $chlane, $wid, lane: $lane chunksz: $chunksz\n")
+#     end
+
+#     @synchronize
+
+#     #if wid % cld(warpsz, threads_per_row) == 1 
+#     warps_per_row = cld(workgroup, max(warpsz, chunksz))
+#     if wid <= cld(chunksz * warps_per_row, warpsz)
+#         idx = cld(lane, warps_per_row) + ((lane - 1) % warps_per_row) * chunksz + (wid - 1) * cld(warpsz, warps_per_row)
+#         val = shared[idx]
+#         offset = 1
+#         #gid == 1 && wid == 1 && @print("secc:  $val, $lane, $idx, $wid, idx: $idx, warps_per_row: $warps_per_row, abc: $(warps_per_row)\n")
+#         while offset < warps_per_row
+#             shuffled = @shfl(Up, val, offset)
+#             if lane > offset
+#                 val = op(val, shuffled)
+#             end
+#             offset <<= 1
+#         end
+#         if lane % warps_per_row == 0 && cld(lane, warps_per_row) <= chunksz
+#             idx = (sid - 1) * chunksz + (wid - 1) * cld(warpsz, warps_per_row) + cld(lane, warps_per_row)
+#             if idx <= n
+#                 if Nblocks == 1
+#                     dst[idx] = g(val)
+#                 else
+#                     partial[(schid-1)*n+idx] = val
+#                     @access flag[(schid-1)*n+idx] = 0x01
+#                 end
+#             end
+#         end
+#     end
+#     Nblocks == 1 && Base.@goto done
+#     if gid % Nblocks == 1
+#         col = chunk
+#         if global_row <= n && col <= Nblocks
+#             while true
+#                 (@access flag[(col-1)*n+global_row]) == 0x01 && break
+#             end
+#             val = partial[(col-1)*n+global_row]
+#         end
+#         col += Nchunks
+#         if global_row <= n
+#             while col <= Nblocks
+#                 while true
+#                     (@access flag[(col-1)*n+global_row]) == 0x01 && break
+#                 end
+#                 @inbounds val = op(val, partial[(col-1)*n+global_row])
+#                 col += Nchunks
+#             end
+#         end
+#         offset = chunksz
+#         #global_row == 1 && @print("$val,    $lane    $chunksz", "\n")
+#         #gid == 1 && global_row == 2 && @print("$val,  $(cld(lid,chunksz)),  wid: $wid, lane: $lane chunksz: $chunksz\n")
+#         while offset < min(chunksz * Nblocks, warpsz)
+#             shuffled = @shfl(Up, val, offset)
+#             if lane > offset
+#                 val = op(val, shuffled)
+#             end
+#             offset <<= 1
+#         end
+#         if chunksz * Nblocks <= warpsz
+#             if global_row <= n && cld(lane, chunksz) == Nblocks
+#                 dst[global_row] = g(val)
+#             end
+#             Base.@goto done
+#         end
+#         #edge case can happen if warpsz < chunksz * Nblocks < workgroup
+#         idx = chunksz <= warpsz ? (wid - 1) * chunksz + chlane : (wid - 1) * warpsz + lane
+#         if (
+#             cld(lid, chunksz) <= Nblocks && cld(lane, chunksz) == cld(warpsz, chunksz)
+#             ||
+#             cld(lid, chunksz) == Nblocks #edge case
+#         )
+#             shared[idx] = val
+#         end
+#         @synchronize
+
+#         # The min is for edge case
+#         warps_per_row = min(cld(workgroup, max(warpsz, chunksz)), Nblocks, cld(chunksz * Nblocks, warpsz))
+#         if wid <= cld(chunksz * warps_per_row, warpsz)
+#             idx = cld(lane, warps_per_row) + ((lane - 1) % warps_per_row) * chunksz + (wid - 1) * cld(warpsz, warps_per_row)
+#             val = shared[idx]
+#             offset = 1
+#             idx = (sid - 1) * chunksz + (wid - 1) * cld(warpsz, warps_per_row) + cld(lane, warps_per_row)
+#             #idx == 7 && @print("$val $lane  $idx  $(chunksz * warps_per_row) \n")
+#             while offset < warps_per_row
+#                 shuffled = @shfl(Up, val, offset)
+#                 #careful to edge case for reduction here: warps_per_row is not necessarily a power of two!!
+#                 if (lane - 1) % warps_per_row + 1 > offset# || lane > warps_per_row && lane - warps_per_row > offset
+#                     val = op(val, shuffled)
+#                 end
+#                 offset <<= 1
+#             end
+
+#             if lane % warps_per_row == 0 && cld(lane, warps_per_row) <= chunksz
+#                 if idx <= n
+#                     dst[idx] = g(val)
+#                 end
+#             end
+#         end
+#     end
+#     Base.@label done
+# end
+
+@kernel unsafe_indices = true inbounds = true function matvec_vload_kernel!(
+    f::F, op::O, g::G,
+    dst::AbstractArray{S},
+    src::AbstractMatrix{T},
+    x,
+    ::Val{Nitem},
+    ::Type{H}
+) where {F<:Function,O<:Function,G<:Function,T,H,S,Nitem}
+    n, p = size(src)
+    workgroup = Int(@groupsize()[1])
+    lid = Int(@index(Local, Linear))
+    gid = Int(@index(Group, Linear))
+    I = (gid - 1) * workgroup + lid
+    row_base = (I - 1) * Nitem + 1
+
+    col_base_idx = row_base
+    x_idx = 1
+
+    # col = 1
+    if col_base_idx + Nitem - 1 <= n * p
+        vals = vload(src, col_base_idx, Val(Nitem), Val(false))
+    else
+        vals = ntuple(i -> src[n*p], Val(Nitem))
+    end
+    vals = isnothing(x) ? f.(vals) : f.(vals, x[x_idx])
+
+    col_base_idx += n
+    x_idx += 1
+
+    # full columns
+    while col_base_idx + Nitem - 1 <= n * p
+        new_vals = vload(src, col_base_idx, Val(Nitem), Val(false))
+        new_vals = isnothing(x) ? f.(new_vals) : f.(new_vals, x[x_idx])
+        vals = op.(vals, new_vals)
+        col_base_idx += n
+        x_idx += 1
+    end
+
+    # last partial column
+    if col_base_idx <= n * p
+        clamped = n * p
+        new_vals = ntuple(i -> src[clamped], Val(Nitem))
+        new_vals = isnothing(x) ? f.(new_vals) : f.(new_vals, x[x_idx])
+        vals = op.(vals, new_vals)
+    end
+
+    # write output
+    if row_base + Nitem - 1 <= n
+        vstore!(dst, row_base, g.(vals), Val(false))
+    else
+        for i in 1:Nitem
+            row = Nitem * (row_base - 1) + i
+            if row <= n
+                dst[row] = g(vals[i])
+            end
+        end
+    end
+end
